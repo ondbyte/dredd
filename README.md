@@ -65,6 +65,125 @@ curl http://localhost:8080/status/01JF...ULID
 
 That's the entire mental model.
 
+### Use dredd in your `docker-compose.yml`
+
+Drop dredd into your project's compose stack as a sandboxed code-execution
+service that the rest of your app calls over HTTP.
+
+**Host prerequisites** (one-time, on every host that will run the dredd
+container):
+
+1. **KVM access.** dredd boots Firecracker MicroVMs, so `/dev/kvm` must
+   exist and your user must be able to open it (`sudo chmod 666 /dev/kvm`
+   or add the runtime user to the `kvm` group).
+2. **Kernel + rootfs files** on the host at `/var/lib/dredd/`. Produce
+   them once with `dredd-build` (see [One-time setup](#one-time-setup))
+   or download pre-built artifacts from your release pipeline. The
+   container mounts this directory read-only.
+
+**Minimal compose snippet** (`docker-compose.yml`):
+
+```yaml
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - dredd-redis:/data
+
+  dredd:
+    image: ghcr.io/ondbyte/dredd:latest   # or build the local Dockerfile
+    # build:
+    #   context: https://github.com/ondbyte/dredd.git
+    #   target: dredd
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      DREDD_HTTP_ADDR: ":8080"
+      DREDD_REDIS_URL: "redis://redis:6379/0"
+      DREDD_KERNEL_PATH: "/var/lib/dredd/kernel/vmlinux"
+      DREDD_LANGUAGES_FILE: "/var/lib/dredd/languages.json"
+      DREDD_ROOTFS_DIR: "/var/lib/dredd/rootfs"
+      DREDD_POOL_STRATEGY: "prewarmed_per_lang"
+      DREDD_POOL_SIZE: "2"
+      DREDD_WORKER_CONCURRENCY: "4"
+    volumes:
+      - /var/lib/dredd:/var/lib/dredd:ro    # kernel + rootfs (built once)
+    devices:
+      - /dev/kvm:/dev/kvm                   # Firecracker needs KVM
+    cap_add:
+      - NET_ADMIN                           # tap-device setup if you use networking
+      - SYS_RESOURCE                        # rlimits for guest processes
+    # If your host kernel / Docker version refuses to pass /dev/kvm without
+    # full privileges, swap the cap_add/devices lines for:
+    # privileged: true
+    expose:
+      - "8080"                              # internal to the compose network
+
+  # Your own application service — talks to dredd via the compose network.
+  app:
+    image: yourorg/yourapp:latest
+    depends_on:
+      - dredd
+    environment:
+      DREDD_URL: "http://dredd:8080"        # call dredd from your code here
+    ports:
+      - "3000:3000"
+
+volumes:
+  dredd-redis:
+```
+
+Then from your application code:
+
+```bash
+# Inside the `app` container, dredd is reachable on its compose hostname:
+curl -X POST http://dredd:8080/exec -H 'Content-Type: application/json' -d '{
+  "language": "python-3.12",
+  "source":   "print(\"hello from compose\")",
+  "stdins":   [""]
+}'
+```
+
+**Building rootfs images as a one-shot service** (optional). If you want
+the compose stack itself to bootstrap the language rootfs files the first
+time it runs, add a setup profile that uses the `dredd-build` image:
+
+```yaml
+services:
+  dredd-build:
+    image: ghcr.io/ondbyte/dredd-build:latest
+    profiles: ["setup"]                     # only runs on `compose --profile setup up`
+    privileged: true                        # needs loop mount + mkfs.ext4
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/dredd:/var/lib/dredd
+    environment:
+      DREDD_AGENT_BINARY: "/usr/local/bin/dreddagent"
+      DREDD_LANGUAGES_FILE: "/var/lib/dredd/languages.json"
+      DREDD_ROOTFS_DIR: "/var/lib/dredd/rootfs"
+    command: >
+      add --image python:3.12 --id python-3.12
+          --name Python --version 3.12
+          --source main.py --run "python3 /work/main.py"
+```
+
+Run it with `docker compose --profile setup run --rm dredd-build` for each
+language you want to register. The output (`languages.json` + per-language
+`.ext4` files) is written into the shared `/var/lib/dredd` volume that
+the long-running `dredd` service mounts.
+
+**Notes on running in cloud Compose hosts**:
+
+- KVM is **not available** in most managed container platforms
+  (ECS Fargate, Cloud Run, App Runner). Run dredd on bare-metal or
+  KVM-enabled VMs (EC2 metal, GCE nested-virt, Hetzner / dedicated hosts,
+  your own Kubernetes node).
+- For development without KVM, run the API + queue parts of dredd against
+  the `DockerExecutor` (see [Testing](#testing)) — this is a code path
+  used by the test suite, not the production binary.
+
 ---
 
 ## Supported Languages
