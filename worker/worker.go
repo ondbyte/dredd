@@ -24,15 +24,21 @@ import (
 )
 
 // Executor is the seam the worker depends on. Production wiring uses
-// FirecrackerExecutor (which acquires a VM from a pool and talks vsock to
-// the guest agent); tests can plug in any implementation.
+// pool.NewExecutor (which acquires a VM from a pool and talks vsock to
+// the guest agent); tests can plug in any implementation
+// (dreddtest.LocalExecutor, dreddtest.DockerExecutor, dreddtest.FlakyExecutor).
 //
 // Contract:
-//   - A returned error must mean a VM-side failure (boot, transport,
-//     timeout). The worker will retry on a fresh VM exactly once.
-//   - A nil error means the user code was actually executed. Compile
-//     errors and per-case results go inside the ExecResponse — the worker
-//     will not retry, even if every case failed.
+//   - A non-nil error means the request never produced a useful result.
+//     The worker treats this as a transport / VM-side failure and retries
+//     on a fresh executor call exactly once before marking the job failed.
+//   - A nil error means user code was actually executed. Compile errors
+//     and per-case results go inside the ExecResponse — the worker will
+//     not retry, even if every case failed.
+//
+// LocalExecutor and DockerExecutor never return errors in normal use, so
+// the retry path is only exercised by Firecracker-backed pools and
+// FlakyExecutor in tests.
 type Executor interface {
 	Execute(ctx context.Context, langID string, req *agent.ExecRequest) (*agent.ExecResponse, error)
 }
@@ -82,11 +88,18 @@ func (w *Worker) loop(ctx context.Context, id int) {
 func (w *Worker) process(ctx context.Context, jobID string) {
 	job, err := w.q.Load(ctx, jobID)
 	if err != nil {
+		// Redis transient errors are logged; the job will be re-dequeued
+		// next iteration if it's still on the queue list. Permanent
+		// corruption is surfaced by Load returning a parse error.
 		log.Printf("worker: load %s: %v", jobID, err)
 		return
 	}
 	if err := w.q.SetRunning(ctx, jobID); err != nil {
-		log.Printf("worker: setRunning %s: %v", jobID, err)
+		// If we can't even mark the job running, Redis is sick. Bail —
+		// retrying would just rack up failed Finish writes and lose the
+		// result. The job stays in whatever state Redis last persisted.
+		log.Printf("worker: setRunning %s: %v (abandoning attempt)", jobID, err)
+		return
 	}
 	lang, ok := w.reg.Get(job.Language)
 	if !ok {

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -24,8 +25,23 @@ type execResponse struct {
 }
 
 func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
+	// Cap request body to MaxRequestBytes to keep a malicious client from
+	// pushing a multi-GB payload through the JSON decoder. Zero disables
+	// the cap (not recommended).
+	body := r.Body
+	if s.cfg.MaxRequestBytes > 0 {
+		body = http.MaxBytesReader(w, r.Body, s.cfg.MaxRequestBytes)
+	}
 	var req execRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeErr(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("request body exceeds %d bytes", mbe.Limit))
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
@@ -37,9 +53,13 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "unknown language: "+req.Language)
 		return
 	}
-	id := ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader).String()
+	id, err := ulid.New(ulid.Timestamp(time.Now()), rand.Reader)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "id: "+err.Error())
+		return
+	}
 	job := &jobs.Job{
-		ID:            id,
+		ID:            id.String(),
 		Language:      req.Language,
 		Source:        req.Source,
 		Stdins:        req.Stdins,
@@ -53,7 +73,7 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(execResponse{ID: id})
+	_ = json.NewEncoder(w).Encode(execResponse{ID: job.ID})
 }
 
 func validate(r execRequest) error {

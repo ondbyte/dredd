@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ondbyte/dredd/config"
 	"github.com/ondbyte/dredd/firecracker"
@@ -19,10 +20,11 @@ type prewarmedGeneric struct {
 	drv    *firecracker.Driver
 	size   int
 	pool   chan *firecracker.VM
-	mu     sync.Mutex
+	sem    bootSemaphore
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	closed atomic.Bool
 }
 
 func newPrewarmedGeneric(cfg *config.Config, drv *firecracker.Driver, _ *langs.Registry) (*prewarmedGeneric, error) {
@@ -32,6 +34,7 @@ func newPrewarmedGeneric(cfg *config.Config, drv *firecracker.Driver, _ *langs.R
 		drv:    drv,
 		size:   cfg.PoolSize,
 		pool:   make(chan *firecracker.VM, cfg.PoolSize),
+		sem:    newBootSemaphore(cfg.BootConcurrency),
 		ctx:    ctx,
 		cancel: cancel,
 	}
@@ -44,9 +47,15 @@ func newPrewarmedGeneric(cfg *config.Config, drv *firecracker.Driver, _ *langs.R
 
 func (p *prewarmedGeneric) refill() {
 	defer p.wg.Done()
+	if !p.sem.acquire(p.ctx) {
+		return
+	}
 	vm, err := p.boot()
+	p.sem.release()
 	if err != nil {
-		log.Printf("pool prewarmed_generic: boot failed: %v", err)
+		if p.ctx.Err() == nil {
+			log.Printf("pool prewarmed_generic: boot failed: %v", err)
+		}
 		return
 	}
 	select {
@@ -72,10 +81,15 @@ func (p *prewarmedGeneric) boot() (*firecracker.VM, error) {
 }
 
 func (p *prewarmedGeneric) Acquire(ctx context.Context, _ string) (*firecracker.VM, error) {
+	if p.closed.Load() {
+		return nil, errPoolClosed
+	}
 	select {
 	case vm := <-p.pool:
-		p.wg.Add(1)
-		go p.refill()
+		if !p.closed.Load() {
+			p.wg.Add(1)
+			go p.refill()
+		}
 		return vm, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -85,12 +99,15 @@ func (p *prewarmedGeneric) Acquire(ctx context.Context, _ string) (*firecracker.
 func (p *prewarmedGeneric) Release(vm *firecracker.VM) { vm.Kill() }
 func (p *prewarmedGeneric) Discard(vm *firecracker.VM) { vm.Kill() }
 
+// Close stops accepting new Acquires, waits for in-flight refills to settle,
+// then drains the pool. Order matches prewarmedPerLang.Close.
 func (p *prewarmedGeneric) Close() error {
+	p.closed.Store(true)
 	p.cancel()
+	p.wg.Wait()
 	close(p.pool)
 	for vm := range p.pool {
 		vm.Kill()
 	}
-	p.wg.Wait()
 	return nil
 }

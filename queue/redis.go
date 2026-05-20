@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/ondbyte/dredd/agent"
@@ -76,6 +77,10 @@ func (q *Queue) Dequeue(ctx context.Context) (string, error) {
 }
 
 // Load reads a job hash. Returns ErrNotFound if the key is missing.
+//
+// Parse failures on any structured field (stdins/results JSON, integer
+// limits) are surfaced rather than silently dropped: a corrupt hash should
+// never look like a partially-populated job.
 func (q *Queue) Load(ctx context.Context, id string) (*jobs.Job, error) {
 	m, err := q.rdb.HGetAll(ctx, jobKey(id)).Result()
 	if err != nil {
@@ -93,16 +98,28 @@ func (q *Queue) Load(ctx context.Context, id string) (*jobs.Job, error) {
 		CompileError: m["compile_error"],
 	}
 	if s := m["stdins"]; s != "" {
-		_ = json.Unmarshal([]byte(s), &j.Stdins)
+		if err := json.Unmarshal([]byte(s), &j.Stdins); err != nil {
+			return nil, fmt.Errorf("decode stdins for %s: %w", id, err)
+		}
 	}
 	if s := m["results"]; s != "" {
-		_ = json.Unmarshal([]byte(s), &j.Results)
+		if err := json.Unmarshal([]byte(s), &j.Results); err != nil {
+			return nil, fmt.Errorf("decode results for %s: %w", id, err)
+		}
 	}
 	if s := m["time_limit_ms"]; s != "" {
-		fmt.Sscanf(s, "%d", &j.TimeLimitMs)
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, fmt.Errorf("decode time_limit_ms for %s: %w", id, err)
+		}
+		j.TimeLimitMs = n
 	}
 	if s := m["memory_limit_mb"]; s != "" {
-		fmt.Sscanf(s, "%d", &j.MemoryLimitMb)
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, fmt.Errorf("decode memory_limit_mb for %s: %w", id, err)
+		}
+		j.MemoryLimitMb = n
 	}
 	return j, nil
 }

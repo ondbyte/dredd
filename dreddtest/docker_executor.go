@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/ondbyte/dredd/agent"
@@ -47,8 +48,11 @@ type DockerExecutor struct {
 	// PullTimeout caps how long an initial `docker pull` may take.
 	PullTimeout time.Duration
 
-	// PulledImages tracks which images we've ensured are present.
-	pulled map[string]bool
+	// pulled tracks which images we've already verified are present locally.
+	// Guarded by ensureMu so concurrent Execute calls don't race the map
+	// and don't kick off duplicate `docker pull` commands.
+	ensureMu sync.Mutex
+	pulled   map[string]bool
 }
 
 // NewDockerExecutor builds an executor with sensible defaults.
@@ -154,7 +158,12 @@ func (e *DockerExecutor) MissingImages(ctx context.Context) ([]string, error) {
 	return missing, nil
 }
 
+// ensureImage verifies an image is locally available, pulling it once if
+// not. Concurrent callers serialize on ensureMu so the map stays
+// race-free and duplicate `docker pull` invocations don't fire.
 func (e *DockerExecutor) ensureImage(ctx context.Context, image string) error {
+	e.ensureMu.Lock()
+	defer e.ensureMu.Unlock()
 	if e.pulled[image] {
 		return nil
 	}

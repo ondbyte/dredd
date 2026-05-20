@@ -54,3 +54,29 @@ func vmWorkDir(prefix string) (string, error) {
 	return filepath.Clean(dir), nil
 }
 
+// bootSemaphore caps the number of concurrent Firecracker boots in flight.
+// Booting every language × PoolSize VMs in parallel can exhaust KVM /
+// file-descriptor / memory limits on real hosts; the semaphore keeps at
+// most cfg.BootConcurrency boots running at once.
+type bootSemaphore chan struct{}
+
+func newBootSemaphore(n int) bootSemaphore {
+	if n < 1 {
+		n = 1
+	}
+	return make(bootSemaphore, n)
+}
+
+// acquire blocks until a slot is available or ctx is done. Returns false if
+// ctx fired before a slot opened — callers should abandon the boot.
+func (b bootSemaphore) acquire(ctx context.Context) bool {
+	select {
+	case b <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (b bootSemaphore) release() { <-b }
+

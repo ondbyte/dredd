@@ -25,6 +25,7 @@ type Config struct {
 	GenericRootfs      string // used by prewarmed_generic strategy
 	PoolStrategy       PoolStrategy
 	PoolSize           int
+	BootConcurrency    int // max parallel Firecracker boots at startup / refill
 	WorkerConcurrency  int
 	ResultTTL          time.Duration
 	VMVcpus            int
@@ -32,7 +33,10 @@ type Config struct {
 	DefaultTimeLimit   time.Duration
 	DefaultMemoryLimit int
 	OutputLimitBytes   int
-	FirecrackerBin     string
+	// MaxRequestBytes caps the size of a single /exec request body. Set to 0
+	// to disable the cap (not recommended).
+	MaxRequestBytes int64
+	FirecrackerBin  string
 }
 
 func FromEnv() (*Config, error) {
@@ -46,6 +50,7 @@ func FromEnv() (*Config, error) {
 		GenericRootfs:      env("DREDD_GENERIC_ROOTFS", ""),
 		PoolStrategy:       PoolStrategy(env("DREDD_POOL_STRATEGY", string(PoolPrewarmedPerLang))),
 		PoolSize:           envInt("DREDD_POOL_SIZE", 1),
+		BootConcurrency:    envInt("DREDD_BOOT_CONCURRENCY", 8),
 		WorkerConcurrency:  envInt("DREDD_WORKER_CONCURRENCY", 4),
 		ResultTTL:          time.Duration(envInt("DREDD_RESULT_TTL_SECONDS", 300)) * time.Second,
 		VMVcpus:            envInt("DREDD_VM_VCPUS", 1),
@@ -53,6 +58,7 @@ func FromEnv() (*Config, error) {
 		DefaultTimeLimit:   time.Duration(envInt("DREDD_DEFAULT_TIME_LIMIT_MS", 2000)) * time.Millisecond,
 		DefaultMemoryLimit: envInt("DREDD_DEFAULT_MEMORY_LIMIT_MB", 256),
 		OutputLimitBytes:   envInt("DREDD_OUTPUT_LIMIT_BYTES", 1<<20),
+		MaxRequestBytes:    int64(envInt("DREDD_MAX_REQUEST_BYTES", 4<<20)), // 4 MiB
 		FirecrackerBin:     env("DREDD_FIRECRACKER_BIN", "firecracker"),
 	}
 
@@ -72,6 +78,9 @@ func FromEnv() (*Config, error) {
 	}
 	if c.PoolSize < 1 {
 		c.PoolSize = 1
+	}
+	if c.BootConcurrency < 1 {
+		c.BootConcurrency = 1
 	}
 	if c.WorkerConcurrency < 1 {
 		c.WorkerConcurrency = 1
