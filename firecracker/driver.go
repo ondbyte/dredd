@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -104,9 +105,25 @@ func (d *Driver) Boot(ctx context.Context, opt BootOptions) (*VM, error) {
 		vm.Kill()
 		return nil, fmt.Errorf("boot-source: %w", err)
 	}
+	// Give the VM its own writable copy of the rootfs. Firecracker mounts
+	// the drive r/w, and dreddagent + user code will both write to it
+	// (compile output, /work/main.<ext>, /tmp scratch). Sharing the
+	// pristine file would (a) accumulate state from previous runs and
+	// (b) leave the ext4 journal in a "needs recovery" state after each
+	// VM kill — the next mount logs `mounting fs with errors`, and on
+	// some images (node, ruby, anything that hits /tmp during init) the
+	// recovery hangs long enough that the agent never gets to listen
+	// on vsock. `cp --reflink=auto` keeps this near-free on btrfs/xfs;
+	// on ext4 we pay the full file size, but that's still cheaper than
+	// hitting the dirty-journal path.
+	perVMRootfs := filepath.Join(opt.WorkDir, "rootfs.ext4")
+	if err := cloneFile(opt.RootfsPath, perVMRootfs); err != nil {
+		vm.Kill()
+		return nil, fmt.Errorf("clone rootfs: %w", err)
+	}
 	if err := api.put(ctx, "/drives/rootfs", map[string]any{
 		"drive_id":       "rootfs",
-		"path_on_host":   opt.RootfsPath,
+		"path_on_host":   perVMRootfs,
 		"is_root_device": true,
 		"is_read_only":   false,
 	}); err != nil {
@@ -186,6 +203,30 @@ func (c *apiClient) put(ctx context.Context, path string, body any) error {
 		return fmt.Errorf("firecracker API %s -> %s", path, resp.Status)
 	}
 	return nil
+}
+
+// cloneFile copies src to dst, preferring `cp --reflink=auto` so that
+// on COW-capable filesystems (btrfs, xfs, recent ext4 with `mkfs.ext4
+// -O reflink`) we pay no allocation cost and can boot in milliseconds.
+// Falls back to a streaming copy when reflink isn't supported.
+func cloneFile(src, dst string) error {
+	if err := exec.Command("cp", "--reflink=auto", "--sparse=always", src, dst).Run(); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 func waitForSocket(ctx context.Context, path string, timeout time.Duration) error {
